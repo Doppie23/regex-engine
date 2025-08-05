@@ -148,8 +148,6 @@ const Regex = struct {
     }
 
     pub fn isMatch(self: Regex, string: []const u8) !bool {
-        _ = .{ self, string };
-
         const State = struct {
             instruction_idx: usize,
             string_idx: usize,
@@ -182,18 +180,26 @@ const Regex = struct {
             }
             const char = string[state.string_idx];
 
-            const char_is_match = blk: switch (inst.regex_type) {
+            const instruction_completed = blk: switch (inst.regex_type) {
                 .literal => |expected| {
                     break :blk (char == expected);
                 },
-                else => {
-                    return error.UnimplementedRegexType;
+                .dot => {
+                    break :blk true;
+                },
+                .group => {
+                    // TODO:
+                    // make this function recursive, return all possible
+                    // matches, with how many consumed, with a bool indicating
+                    // if we should get partal or full matches
+                    // add all matches to the queue based on below modifier logic
+                    return error.Unimplemented;
                 },
             };
 
             switch (inst.modifier) {
                 .none => {
-                    if (char_is_match) {
+                    if (instruction_completed) {
                         try queue.append(.{
                             .instruction_idx = state.instruction_idx + 1,
                             .string_idx = state.string_idx + 1,
@@ -201,7 +207,7 @@ const Regex = struct {
                     }
                 },
                 .plus => {
-                    if (char_is_match) {
+                    if (instruction_completed) {
                         try queue.append(.{
                             .instruction_idx = state.instruction_idx + 1,
                             .string_idx = state.string_idx + 1,
@@ -213,7 +219,7 @@ const Regex = struct {
                     }
                 },
                 .star => {
-                    if (char_is_match) {
+                    if (instruction_completed) {
                         try queue.append(.{
                             .instruction_idx = state.instruction_idx + 1,
                             .string_idx = state.string_idx + 1,
@@ -222,25 +228,23 @@ const Regex = struct {
                             .instruction_idx = state.instruction_idx,
                             .string_idx = state.string_idx + 1,
                         });
-                    } else {
-                        try queue.append(.{
-                            .instruction_idx = state.instruction_idx + 1,
-                            .string_idx = state.string_idx,
-                        });
                     }
+                    try queue.append(.{
+                        .instruction_idx = state.instruction_idx + 1,
+                        .string_idx = state.string_idx,
+                    });
                 },
                 .optional => {
-                    if (char_is_match) {
+                    if (instruction_completed) {
                         try queue.append(.{
                             .instruction_idx = state.instruction_idx + 1,
                             .string_idx = state.string_idx + 1,
                         });
-                    } else {
-                        try queue.append(.{
-                            .instruction_idx = state.instruction_idx + 1,
-                            .string_idx = state.string_idx,
-                        });
                     }
+                    try queue.append(.{
+                        .instruction_idx = state.instruction_idx + 1,
+                        .string_idx = state.string_idx,
+                    });
                 },
             }
         }
@@ -254,7 +258,7 @@ pub fn main() !void {
 
     // const string = "a+(b|c)?";
     // const string = "a?b";
-    const regex_string = "a?b";
+    const regex_string = "a*ab?b";
     const regex = try Regex.init(allocator, regex_string);
 
     // std.debug.print("{any}\n", .{regex.instructions});
