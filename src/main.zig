@@ -148,12 +148,27 @@ const Regex = struct {
     }
 
     pub fn isMatch(self: Regex, string: []const u8) !bool {
+        const res = try consumeMatch(self.allocator, self.instructions, string, .only_full);
+        defer self.allocator.free(res);
+        return res.len > 0;
+    }
+
+    const MatchType = enum {
+        only_full,
+        partial,
+    };
+
+    /// returns the amount of consumed characters
+    fn consumeMatch(allocator: std.mem.Allocator, instructions: []const RegexInst, string: []const u8, match_type: MatchType) ![]usize {
         const State = struct {
             instruction_idx: usize,
             string_idx: usize,
         };
 
-        var queue = std.ArrayList(State).init(self.allocator);
+        var possible_matches = std.ArrayList(usize).init(allocator);
+        defer possible_matches.deinit();
+
+        var queue = std.ArrayList(State).init(allocator);
         defer queue.deinit();
 
         try queue.append(.{
@@ -164,92 +179,108 @@ const Regex = struct {
         while (queue.items.len > 0) {
             const state = queue.pop().?;
 
-            if (state.instruction_idx >= self.instructions.len and state.string_idx >= string.len) {
-                // done with string and instructions, means a match
-                return true;
+            if (state.instruction_idx >= instructions.len and state.string_idx >= string.len) {
+                // done with string and instructions, means a full match
+                try possible_matches.append(state.string_idx);
+                if (match_type == .only_full) {
+                    break;
+                } else {
+                    continue;
+                }
             }
 
-            if (state.instruction_idx >= self.instructions.len) {
+            if (state.instruction_idx >= instructions.len) {
                 // went through all instructions, yet still part of string left
+                // so a partial match
+
+                if (match_type == .partial) {
+                    try possible_matches.append(state.string_idx);
+                }
                 continue;
             }
-            const inst = self.instructions[state.instruction_idx];
+            const inst = instructions[state.instruction_idx];
             if (state.string_idx >= string.len) {
                 // went through the entire string, but still instructions left
+                // means a dead end
                 continue;
             }
             const char = string[state.string_idx];
 
-            const instruction_completed = blk: switch (inst.regex_type) {
+            // get all the possible valid paths based on the regex instruction
+            const amounts_consumed: []const usize = blk: switch (inst.regex_type) {
                 .literal => |expected| {
-                    break :blk (char == expected);
+                    break :blk &.{(if (char == expected) 1 else 0)};
                 },
                 .dot => {
-                    break :blk true;
+                    break :blk &.{1};
                 },
-                .group => {
-                    // TODO:
-                    // make this function recursive, return all possible
-                    // matches, with how many consumed, with a bool indicating
-                    // if we should get partal or full matches
-                    // add all matches to the queue based on below modifier logic
-                    return error.Unimplemented;
+                .group => |group_instructions| {
+                    const t = try consumeMatch(allocator, group_instructions, string[state.string_idx..], .partial);
+                    break :blk t;
                 },
             };
 
-            switch (inst.modifier) {
-                .none => {
-                    if (instruction_completed) {
+            // determine based on the modifier if all the extra paths we can follow
+            for (amounts_consumed) |consumed| {
+                switch (inst.modifier) {
+                    .none => {
+                        if (consumed > 0) {
+                            try queue.append(.{
+                                .instruction_idx = state.instruction_idx + 1,
+                                .string_idx = state.string_idx + consumed,
+                            });
+                        }
+                    },
+                    .plus => {
+                        if (consumed > 0) {
+                            try queue.append(.{
+                                .instruction_idx = state.instruction_idx + 1,
+                                .string_idx = state.string_idx + consumed,
+                            });
+                            try queue.append(.{
+                                .instruction_idx = state.instruction_idx,
+                                .string_idx = state.string_idx + consumed,
+                            });
+                        }
+                    },
+                    .star => {
+                        if (consumed > 0) {
+                            try queue.append(.{
+                                .instruction_idx = state.instruction_idx + 1,
+                                .string_idx = state.string_idx + consumed,
+                            });
+                            try queue.append(.{
+                                .instruction_idx = state.instruction_idx,
+                                .string_idx = state.string_idx + consumed,
+                            });
+                        }
                         try queue.append(.{
                             .instruction_idx = state.instruction_idx + 1,
-                            .string_idx = state.string_idx + 1,
+                            .string_idx = state.string_idx,
                         });
-                    }
-                },
-                .plus => {
-                    if (instruction_completed) {
+                    },
+                    .optional => {
+                        if (consumed > 0) {
+                            try queue.append(.{
+                                .instruction_idx = state.instruction_idx + 1,
+                                .string_idx = state.string_idx + consumed,
+                            });
+                        }
                         try queue.append(.{
                             .instruction_idx = state.instruction_idx + 1,
-                            .string_idx = state.string_idx + 1,
+                            .string_idx = state.string_idx,
                         });
-                        try queue.append(.{
-                            .instruction_idx = state.instruction_idx,
-                            .string_idx = state.string_idx + 1,
-                        });
-                    }
-                },
-                .star => {
-                    if (instruction_completed) {
-                        try queue.append(.{
-                            .instruction_idx = state.instruction_idx + 1,
-                            .string_idx = state.string_idx + 1,
-                        });
-                        try queue.append(.{
-                            .instruction_idx = state.instruction_idx,
-                            .string_idx = state.string_idx + 1,
-                        });
-                    }
-                    try queue.append(.{
-                        .instruction_idx = state.instruction_idx + 1,
-                        .string_idx = state.string_idx,
-                    });
-                },
-                .optional => {
-                    if (instruction_completed) {
-                        try queue.append(.{
-                            .instruction_idx = state.instruction_idx + 1,
-                            .string_idx = state.string_idx + 1,
-                        });
-                    }
-                    try queue.append(.{
-                        .instruction_idx = state.instruction_idx + 1,
-                        .string_idx = state.string_idx,
-                    });
-                },
+                    },
+                }
+            }
+
+            if (inst.regex_type == .group) {
+                // TODO: this is not great..., should prob use an internal arena scratch alloc?
+                allocator.free(amounts_consumed);
             }
         }
 
-        return false;
+        return possible_matches.toOwnedSlice();
     }
 };
 
@@ -258,12 +289,13 @@ pub fn main() !void {
 
     // const string = "a+(b|c)?";
     // const string = "a?b";
-    const regex_string = "a*ab?b";
+    // const regex_string = "a*ab?b";
+    const regex_string = "(ab)*ab?";
     const regex = try Regex.init(allocator, regex_string);
 
     // std.debug.print("{any}\n", .{regex.instructions});
 
-    const string = "ab";
+    const string = "a";
 
     const b = regex.isMatch(string);
 
@@ -382,4 +414,89 @@ test "regex compilation groups" {
     try std.testing.expectEqual(expected[0], actual[0]);
     try std.testing.expectEqual(expected[1].modifier, actual[1].modifier);
     try std.testing.expectEqualSlices(Regex.RegexInst, expected[1].regex_type.group, actual[1].regex_type.group);
+}
+
+test "matches" {
+    const allocator = std.testing.allocator;
+
+    const TestString = struct {
+        string: []const u8,
+        is_match: bool,
+    };
+
+    const Test = struct {
+        regex_string: []const u8,
+        test_strings: []const TestString,
+    };
+
+    const tests = [_]Test{
+        .{
+            .regex_string = "a*a",
+            .test_strings = &[_]TestString{
+                .{ .string = "aa", .is_match = true },
+                .{ .string = "a", .is_match = true },
+                .{ .string = "aaaaaa", .is_match = true },
+                .{ .string = "ab", .is_match = false },
+            },
+        },
+        .{
+            .regex_string = "a+a",
+            .test_strings = &[_]TestString{
+                .{ .string = "aa", .is_match = true },
+                .{ .string = "aaaaaa", .is_match = true },
+                .{ .string = "ab", .is_match = false },
+                .{ .string = "a", .is_match = false },
+            },
+        },
+        .{
+            .regex_string = ".*a",
+            .test_strings = &[_]TestString{
+                .{ .string = "aa", .is_match = true },
+                .{ .string = "aaaaaa", .is_match = true },
+                .{ .string = "babaa", .is_match = true },
+                .{ .string = "a", .is_match = true },
+            },
+        },
+        .{
+            .regex_string = "a*ab?b",
+            .test_strings = &[_]TestString{
+                .{ .string = "ab", .is_match = true },
+                .{ .string = "aaaab", .is_match = true },
+                .{ .string = "aaaabb", .is_match = true },
+                .{ .string = "aaaabbb", .is_match = false },
+            },
+        },
+        .{
+            .regex_string = "(ab)*ab",
+            .test_strings = &[_]TestString{
+                .{ .string = "ab", .is_match = true },
+                .{ .string = "abab", .is_match = true },
+                .{ .string = "ababab", .is_match = true },
+                .{ .string = "ba", .is_match = false },
+            },
+        },
+        // .{
+        //     .regex_string = "(ab)*ab?",
+        //     .test_strings = &[_]TestString{
+        //         .{ .string = "ab", .is_match = true },
+        //         .{ .string = "ababab", .is_match = true },
+        //         .{ .string = "a", .is_match = true },
+        //         // .{ .string = "ababa", .is_match = true },
+        //         // .{ .string = "ba", .is_match = false },
+        //     },
+        // },
+    };
+
+    for (tests) |t| {
+        const regex = try Regex.init(allocator, t.regex_string);
+        defer regex.deinit();
+        for (t.test_strings) |test_string| {
+            const actual = regex.isMatch(test_string.string);
+
+            const fmt = "regex: {s}; string: {s} - {any}";
+            const expected = try std.fmt.allocPrint(allocator, fmt, .{ t.regex_string, test_string.string, test_string.is_match });
+            defer allocator.free(expected);
+            try std.testing.expectFmt(expected, fmt, .{ t.regex_string, test_string.string, actual });
+        }
+    }
 }
