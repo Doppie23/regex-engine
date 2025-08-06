@@ -201,7 +201,11 @@ const Regex = struct {
             const inst = instructions[state.instruction_idx];
             if (state.string_idx >= string.len) {
                 // went through the entire string, but still instructions left
-                // means a dead end
+                // means a dead end, unless there is modifier that allows it
+                // TODO: hacky
+                if (inst.modifier == .optional or inst.modifier == .star) {
+                    try possible_matches.append(state.string_idx);
+                }
                 continue;
             }
             const char = string[state.string_idx];
@@ -215,35 +219,24 @@ const Regex = struct {
                     break :blk &.{1};
                 },
                 .group => |group_instructions| {
-                    const t = try consumeMatch(allocator, group_instructions, string[state.string_idx..], .partial);
-                    break :blk t;
+                    break :blk try consumeMatch(allocator, group_instructions, string[state.string_idx..], .partial);
                 },
             };
 
             // determine based on the modifier if all the extra paths we can follow
-            for (amounts_consumed) |consumed| {
-                switch (inst.modifier) {
-                    .none => {
+            switch (inst.modifier) {
+                .none => {
+                    for (amounts_consumed) |consumed| {
                         if (consumed > 0) {
                             try queue.append(.{
                                 .instruction_idx = state.instruction_idx + 1,
                                 .string_idx = state.string_idx + consumed,
                             });
                         }
-                    },
-                    .plus => {
-                        if (consumed > 0) {
-                            try queue.append(.{
-                                .instruction_idx = state.instruction_idx + 1,
-                                .string_idx = state.string_idx + consumed,
-                            });
-                            try queue.append(.{
-                                .instruction_idx = state.instruction_idx,
-                                .string_idx = state.string_idx + consumed,
-                            });
-                        }
-                    },
-                    .star => {
+                    }
+                },
+                .plus => {
+                    for (amounts_consumed) |consumed| {
                         if (consumed > 0) {
                             try queue.append(.{
                                 .instruction_idx = state.instruction_idx + 1,
@@ -254,24 +247,40 @@ const Regex = struct {
                                 .string_idx = state.string_idx + consumed,
                             });
                         }
-                        try queue.append(.{
-                            .instruction_idx = state.instruction_idx + 1,
-                            .string_idx = state.string_idx,
-                        });
-                    },
-                    .optional => {
+                    }
+                },
+                .star => {
+                    for (amounts_consumed) |consumed| {
+                        if (consumed > 0) {
+                            try queue.append(.{
+                                .instruction_idx = state.instruction_idx + 1,
+                                .string_idx = state.string_idx + consumed,
+                            });
+                            try queue.append(.{
+                                .instruction_idx = state.instruction_idx,
+                                .string_idx = state.string_idx + consumed,
+                            });
+                        }
+                    }
+                    try queue.append(.{
+                        .instruction_idx = state.instruction_idx + 1,
+                        .string_idx = state.string_idx,
+                    });
+                },
+                .optional => {
+                    for (amounts_consumed) |consumed| {
                         if (consumed > 0) {
                             try queue.append(.{
                                 .instruction_idx = state.instruction_idx + 1,
                                 .string_idx = state.string_idx + consumed,
                             });
                         }
-                        try queue.append(.{
-                            .instruction_idx = state.instruction_idx + 1,
-                            .string_idx = state.string_idx,
-                        });
-                    },
-                }
+                    }
+                    try queue.append(.{
+                        .instruction_idx = state.instruction_idx + 1,
+                        .string_idx = state.string_idx,
+                    });
+                },
             }
 
             if (inst.regex_type == .group) {
@@ -291,6 +300,7 @@ pub fn main() !void {
     // const string = "a?b";
     // const regex_string = "a*ab?b";
     const regex_string = "(ab)*ab?";
+    // const regex_string = "ab?";
     const regex = try Regex.init(allocator, regex_string);
 
     // std.debug.print("{any}\n", .{regex.instructions});
@@ -347,6 +357,19 @@ test "regex compilation modifiers" {
             .expected = &[_]Regex.RegexInst{
                 .{
                     .regex_type = .{ .literal = 'a' },
+                    .modifier = .optional,
+                },
+            },
+        },
+        Test{
+            .regex_string = "ab?",
+            .expected = &[_]Regex.RegexInst{
+                .{
+                    .regex_type = .{ .literal = 'a' },
+                    .modifier = .none,
+                },
+                .{
+                    .regex_type = .{ .literal = 'b' },
                     .modifier = .optional,
                 },
             },
@@ -431,6 +454,29 @@ test "matches" {
 
     const tests = [_]Test{
         .{
+            .regex_string = "ab?",
+            .test_strings = &[_]TestString{
+                .{ .string = "ab", .is_match = true },
+                .{ .string = "a", .is_match = true },
+            },
+        },
+        .{
+            .regex_string = "ab*",
+            .test_strings = &[_]TestString{
+                .{ .string = "ab", .is_match = true },
+                .{ .string = "abbb", .is_match = true },
+                .{ .string = "a", .is_match = true },
+            },
+        },
+        .{
+            .regex_string = "ab+",
+            .test_strings = &[_]TestString{
+                .{ .string = "ab", .is_match = true },
+                .{ .string = "abbb", .is_match = true },
+                .{ .string = "a", .is_match = false },
+            },
+        },
+        .{
             .regex_string = "a*a",
             .test_strings = &[_]TestString{
                 .{ .string = "aa", .is_match = true },
@@ -475,16 +521,16 @@ test "matches" {
                 .{ .string = "ba", .is_match = false },
             },
         },
-        // .{
-        //     .regex_string = "(ab)*ab?",
-        //     .test_strings = &[_]TestString{
-        //         .{ .string = "ab", .is_match = true },
-        //         .{ .string = "ababab", .is_match = true },
-        //         .{ .string = "a", .is_match = true },
-        //         // .{ .string = "ababa", .is_match = true },
-        //         // .{ .string = "ba", .is_match = false },
-        //     },
-        // },
+        .{
+            .regex_string = "(ab)*ab?",
+            .test_strings = &[_]TestString{
+                .{ .string = "ab", .is_match = true },
+                .{ .string = "ababab", .is_match = true },
+                .{ .string = "a", .is_match = true },
+                .{ .string = "ababa", .is_match = true },
+                .{ .string = "ba", .is_match = false },
+            },
+        },
     };
 
     for (tests) |t| {
