@@ -7,10 +7,6 @@ const Regex = struct {
     const RegexInst = struct {
         regex_type: union(enum) {
             literal: u8,
-            // either: struct {
-            //     left: *const RegexChar,
-            //     right: *const RegexChar,
-            // },
             group: []const RegexInst,
             dot,
         },
@@ -148,8 +144,10 @@ const Regex = struct {
     }
 
     pub fn isMatch(self: Regex, string: []const u8) !bool {
-        const res = try consumeMatch(self.allocator, self.instructions, string, .only_full);
-        defer self.allocator.free(res);
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+
+        const res = try consumeMatch(arena.allocator(), self.instructions, string, .only_full);
         return res.len > 0;
     }
 
@@ -159,16 +157,16 @@ const Regex = struct {
     };
 
     /// returns the amount of consumed characters
-    fn consumeMatch(allocator: std.mem.Allocator, instructions: []const RegexInst, string: []const u8, match_type: MatchType) ![]usize {
+    fn consumeMatch(arena: std.mem.Allocator, instructions: []const RegexInst, string: []const u8, match_type: MatchType) ![]usize {
         const State = struct {
             instruction_idx: usize,
             string_idx: usize,
         };
 
-        var possible_matches = std.ArrayList(usize).init(allocator);
+        var possible_matches = std.ArrayList(usize).init(arena);
         defer possible_matches.deinit();
 
-        var queue = std.ArrayList(State).init(allocator);
+        var queue = std.ArrayList(State).init(arena);
         defer queue.deinit();
 
         try queue.append(.{
@@ -199,31 +197,32 @@ const Regex = struct {
                 continue;
             }
             const inst = instructions[state.instruction_idx];
-            if (state.string_idx >= string.len) {
-                // went through the entire string, but still instructions left
-                // means a dead end, unless there is modifier that allows it
-                // TODO: hacky
-                if (inst.modifier == .optional or inst.modifier == .star) {
-                    try possible_matches.append(state.string_idx);
-                }
-                continue;
-            }
-            const char = string[state.string_idx];
+
+            const maybe_char = if (state.string_idx < string.len) string[state.string_idx] else null;
 
             // get all the possible valid paths based on the regex instruction
             const amounts_consumed: []const usize = blk: switch (inst.regex_type) {
                 .literal => |expected| {
-                    break :blk &.{(if (char == expected) 1 else 0)};
+                    if (maybe_char) |char| {
+                        break :blk &.{(if (char == expected) 1 else 0)};
+                    } else {
+                        break :blk &.{0};
+                    }
                 },
                 .dot => {
-                    break :blk &.{1};
+                    if (maybe_char) |_| {
+                        break :blk &.{1};
+                    } else {
+                        break :blk &.{0};
+                    }
                 },
                 .group => |group_instructions| {
-                    break :blk try consumeMatch(allocator, group_instructions, string[state.string_idx..], .partial);
+                    // NOTE: we dont free the returned value here, we just assume it gets cleaned up when the arena is freed.
+                    break :blk try consumeMatch(arena, group_instructions, string[state.string_idx..], .partial);
                 },
             };
 
-            // determine based on the modifier if all the extra paths we can follow
+            // determine based on the modifier all the extra paths we can follow
             switch (inst.modifier) {
                 .none => {
                     for (amounts_consumed) |consumed| {
@@ -281,11 +280,6 @@ const Regex = struct {
                         .string_idx = state.string_idx,
                     });
                 },
-            }
-
-            if (inst.regex_type == .group) {
-                // TODO: this is not great..., should prob use an internal arena scratch alloc?
-                allocator.free(amounts_consumed);
             }
         }
 
