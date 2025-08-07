@@ -106,6 +106,25 @@ const Regex = struct {
                         .modifier = .none,
                     };
                 },
+                '\\' => {
+                    if (current) |e| {
+                        try list.append(e);
+                    }
+
+                    i += 1;
+                    if (i >= regex_string.len) {
+                        return error.InvalidEscapeSeqAtEOF;
+                    }
+
+                    const next_char = regex_string[i];
+
+                    current = .{
+                        .regex_type = .{
+                            .literal = next_char,
+                        },
+                        .modifier = .none,
+                    };
+                },
                 else => {
                     if (current) |e| {
                         try list.append(e);
@@ -395,6 +414,19 @@ test "regex compilation modifiers" {
                 },
             },
         },
+        Test{
+            .regex_string = ".\\.+",
+            .expected = &[_]Regex.RegexInst{
+                .{
+                    .regex_type = .dot,
+                    .modifier = .none,
+                },
+                .{
+                    .regex_type = .{ .literal = '.' },
+                    .modifier = .plus,
+                },
+            },
+        },
     };
 
     for (tests) |t| {
@@ -523,6 +555,13 @@ test "matches" {
                 .{ .string = "a", .is_match = true },
                 .{ .string = "ababa", .is_match = true },
                 .{ .string = "ba", .is_match = false },
+            },
+        },
+        .{
+            .regex_string = ".+@.+\\.com",
+            .test_strings = &[_]TestString{
+                .{ .string = "a@a.com", .is_match = true },
+                .{ .string = "a.com", .is_match = false },
             },
         },
     };
