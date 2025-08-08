@@ -1,8 +1,7 @@
 const std = @import("std");
 
 const Regex = struct {
-    allocator: std.mem.Allocator,
-    instructions: []RegexInst,
+    instructions: []const RegexInst,
 
     const RegexInst = struct {
         regex_type: union(enum) {
@@ -18,152 +17,149 @@ const Regex = struct {
         },
     };
 
-    fn init(allocator: std.mem.Allocator, regex_string: []const u8) !Regex {
-        const insts = try compile(allocator, regex_string);
+    fn init(comptime regex_string: []const u8) Regex {
+        const res = comptime compile(regex_string).resize();
+
         return .{
-            .allocator = allocator,
-            .instructions = insts,
+            .instructions = &res,
         };
     }
 
-    fn compile(allocator: std.mem.Allocator, regex_string: []const u8) ![]RegexInst {
-        var list = std.ArrayList(RegexInst).init(allocator);
-        defer list.deinit();
+    fn CompileResult(comptime max_len: usize) type {
+        return struct {
+            instructions: [max_len]RegexInst,
+            actual_len: usize,
 
-        var current: ?RegexInst = null;
-
-        var i: usize = 0;
-        while (true) {
-            if (i >= regex_string.len) {
-                break;
+            /// copy the buffer at comptime to a smaller array that fits the final result exactly
+            pub fn resize(comptime self: CompileResult(max_len)) [self.actual_len]RegexInst {
+                comptime {
+                    return self.instructions[0..self.actual_len].*;
+                }
             }
-            const c = regex_string[i];
-            defer i += 1;
+        };
+    }
 
-            switch (c) {
-                '*' => {
-                    if (current != null) {
-                        current.?.modifier = .star;
-                    } else {
-                        return error.InvalidStarLoc;
-                    }
-                },
-                '+' => {
-                    if (current != null) {
-                        current.?.modifier = .plus;
-                    } else {
-                        return error.InvalidPlusLoc;
-                    }
-                },
-                '?' => {
-                    if (current != null) {
-                        current.?.modifier = .optional;
-                    } else {
-                        return error.InvalidQuestionMarkLoc;
-                    }
-                },
-                '(' => {
-                    if (current) |e| {
-                        try list.append(e);
-                    }
+    fn compile(comptime regex_string: []const u8) CompileResult(regex_string.len) {
+        comptime {
+            // final instruction list will never be longer than the string length
+            var list: [regex_string.len]RegexInst = undefined;
+            var i = 0;
 
-                    // find matching closing bracket and recurse
-                    const start = i;
-                    var extras: usize = 0;
-                    while (true) {
-                        i += 1;
-                        if (i >= regex_string.len) {
-                            return error.NoClosingBracketFound;
+            var consumed = 0;
+
+            while (consumed < regex_string.len) {
+                const c = regex_string[consumed];
+
+                switch (c) {
+                    '*' => {
+                        if (i == 0) {
+                            @compileError("Error parsing regex: InvalidStarLoc");
+                        } else {
+                            list[i - 1].modifier = .star;
                         }
-                        const nc = regex_string[i];
-                        if (nc == '(') {
-                            extras += 1;
+                        consumed += 1;
+                    },
+                    '+' => {
+                        if (i == 0) {
+                            @compileError("Error parsing regex: InvalidPlusLoc");
+                        } else {
+                            list[i - 1].modifier = .plus;
                         }
-                        if (nc == ')') {
-                            if (extras == 0) {
-                                break;
-                            } else {
-                                extras -= 1;
+                        consumed += 1;
+                    },
+                    '?' => {
+                        if (i == 0) {
+                            @compileError("Error parsing regex: InvalidQuestionMarkLoc");
+                        } else {
+                            list[i - 1].modifier = .optional;
+                        }
+                        consumed += 1;
+                    },
+                    '(' => {
+                        // find matching closing bracket and recurse
+                        const start = consumed;
+                        var extras: usize = 0;
+
+                        // consume the (
+                        consumed += 1;
+
+                        while (consumed < regex_string.len) : (consumed += 1) {
+                            const nc = regex_string[consumed];
+                            if (nc == '(') {
+                                extras += 1;
+                            }
+                            if (nc == ')') {
+                                if (extras == 0) {
+                                    break;
+                                } else {
+                                    extras -= 1;
+                                }
                             }
                         }
+                        if (consumed >= regex_string.len) {
+                            @compileError("Error parsing regex: NoClosingBracketFound");
+                        }
+
+                        const group = regex_string[start + 1 .. consumed]; // +1 because we do not want to include the brackets
+                        const comp_group = compile(group).resize();
+
+                        list[i] = .{
+                            .regex_type = .{ .group = &comp_group },
+                            .modifier = .none,
+                        };
+                        i += 1;
+                        // finally consume the )
+                        consumed += 1;
+                    },
+                    '.' => {
+                        list[i] = .{
+                            .regex_type = .dot,
+                            .modifier = .none,
+                        };
+                        i += 1;
+                        consumed += 1;
+                    },
+                    '\\' => {
+                        // consume the \
+                        consumed += 1;
+                        if (consumed >= regex_string.len) {
+                            @compileError("Error parsing regex: InvalidEscapeSeqAtEOF");
+                        }
+
+                        const next_char = regex_string[consumed];
+                        // consume the next char
+                        consumed += 1;
+
+                        list[i] = .{
+                            .regex_type = .{
+                                .literal = next_char,
+                            },
+                            .modifier = .none,
+                        };
+                        i += 1;
+                    },
+                    else => {
+                        list[i] = .{
+                            .regex_type = .{
+                                .literal = c,
+                            },
+                            .modifier = .none,
+                        };
+                        i += 1;
+                        consumed += 1;
                     }
-
-                    const group = regex_string[start + 1 .. i]; // +1 because we do not want to include the brackets
-                    const comp_group = try compile(allocator, group);
-
-                    current = .{
-                        .regex_type = .{ .group = comp_group },
-                        .modifier = .none,
-                    };
-                },
-                '.' => {
-                    if (current) |e| {
-                        try list.append(e);
-                    }
-
-                    current = .{
-                        .regex_type = .dot,
-                        .modifier = .none,
-                    };
-                },
-                '\\' => {
-                    if (current) |e| {
-                        try list.append(e);
-                    }
-
-                    i += 1;
-                    if (i >= regex_string.len) {
-                        return error.InvalidEscapeSeqAtEOF;
-                    }
-
-                    const next_char = regex_string[i];
-
-                    current = .{
-                        .regex_type = .{
-                            .literal = next_char,
-                        },
-                        .modifier = .none,
-                    };
-                },
-                else => {
-                    if (current) |e| {
-                        try list.append(e);
-                    }
-
-                    current = .{
-                        .regex_type = .{
-                            .literal = c,
-                        },
-                        .modifier = .none,
-                    };
-                },
+                }
             }
-        }
-        if (current) |e| {
-            try list.append(e);
-        }
 
-        return try list.toOwnedSlice();
+            return .{
+                .instructions = list,
+                .actual_len = i,
+            };
+        }
     }
 
-    pub fn deinit(self: Regex) void {
-        Regex.internalDeinit(self.allocator, self.instructions);
-    }
-
-    fn internalDeinit(allocator: std.mem.Allocator, insts: []const RegexInst) void {
-        for (insts) |inst| {
-            switch (inst.regex_type) {
-                .group => |g| {
-                    internalDeinit(allocator, g);
-                },
-                else => {},
-            }
-        }
-        allocator.free(insts);
-    }
-
-    pub fn isMatch(self: Regex, string: []const u8) !bool {
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
+    pub fn isMatch(self: Regex, allocator: std.mem.Allocator, string: []const u8) !bool {
+        var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
 
         const res = try consumeMatch(arena.allocator(), self.instructions, string, .only_full);
@@ -175,7 +171,7 @@ const Regex = struct {
         partial,
     };
 
-    /// returns the amount of consumed characters
+    /// returns for all possible valid paths (paths where we can exhaust all instructions) the amount of consumed characters
     fn consumeMatch(arena: std.mem.Allocator, instructions: []const RegexInst, string: []const u8, match_type: MatchType) ![]usize {
         const State = struct {
             instruction_idx: usize,
@@ -310,17 +306,17 @@ pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
     // const string = "a+(b|c)?";
-    // const string = "a?b";
-    // const regex_string = "a*ab?b";
-    const regex_string = "(ab)*ab?";
+    // const regex_string = "a?b";
+    const regex_string = "a*ab?b";
+    // const regex_string = "a?(bc?)+";
     // const regex_string = "ab?";
-    const regex = try Regex.init(allocator, regex_string);
+    const regex = Regex.init(regex_string);
 
     // std.debug.print("{any}\n", .{regex.instructions});
 
-    const string = "a";
+    const string = "aabb";
 
-    const b = regex.isMatch(string);
+    const b = regex.isMatch(allocator, string);
 
     std.debug.print("{any}\n", .{b});
     // std.debug.print("{any}\n", .{regex[1]});
@@ -357,8 +353,6 @@ pub fn main() !void {
 }
 
 test "regex compilation modifiers" {
-    const allocator = std.testing.allocator;
-
     const Test = struct {
         expected: []const Regex.RegexInst,
         regex_string: []const u8,
@@ -429,17 +423,14 @@ test "regex compilation modifiers" {
         },
     };
 
-    for (tests) |t| {
-        const regex = try Regex.init(allocator, t.regex_string);
-        defer regex.deinit();
+    inline for (tests) |t| {
+        const regex = Regex.init(t.regex_string);
         const actual = regex.instructions;
         try std.testing.expectEqualSlices(Regex.RegexInst, t.expected, actual);
     }
 }
 
 test "regex compilation groups" {
-    const allocator = std.testing.allocator;
-
     const string = "a?(bc?)+";
     const expected = &[_]Regex.RegexInst{
         .{
@@ -455,8 +446,7 @@ test "regex compilation groups" {
         },
     };
 
-    const regex = try Regex.init(allocator, string);
-    defer regex.deinit();
+    const regex = Regex.init(string);
     const actual = regex.instructions;
 
     try std.testing.expectEqual(expected.len, actual.len);
@@ -566,11 +556,10 @@ test "matches" {
         },
     };
 
-    for (tests) |t| {
-        const regex = try Regex.init(allocator, t.regex_string);
-        defer regex.deinit();
+    inline for (tests) |t| {
+        const regex = Regex.init(t.regex_string);
         for (t.test_strings) |test_string| {
-            const actual = regex.isMatch(test_string.string);
+            const actual = regex.isMatch(allocator, test_string.string);
 
             const fmt = "regex: {s}; string: {s} - {any}";
             const expected = try std.fmt.allocPrint(allocator, fmt, .{ t.regex_string, test_string.string, test_string.is_match });
