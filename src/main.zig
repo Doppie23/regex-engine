@@ -4,87 +4,52 @@ const Regex = struct {
     instructions: []const RegexInst,
 
     const RegexInst = struct {
-        regex_type: union(enum) {
-            literal: u8,
-            group: []const RegexInst,
-            dot,
-        },
-        modifier: enum {
-            none,
-            optional,
-            star,
-            plus,
-        },
+        regex_type: RegexType,
+        modifier: Modifier,
+    };
+
+    const RegexType = union(enum) {
+        literal: u8,
+        group: []const RegexInst,
+        dot,
+    };
+
+    const Modifier = enum {
+        none,
+        optional,
+        star,
+        plus,
     };
 
     fn init(comptime regex_string: []const u8) Regex {
-        const res = comptime compile(regex_string).resize();
-
         return .{
-            .instructions = &res,
+            .instructions = comptime compile(regex_string),
         };
     }
 
-    fn CompileResult(comptime max_len: usize) type {
-        return struct {
-            instructions: [max_len]RegexInst,
-            actual_len: usize,
-
-            /// copy the buffer at comptime to a smaller array that fits the final result exactly
-            pub fn resize(comptime self: CompileResult(max_len)) [self.actual_len]RegexInst {
-                comptime {
-                    return self.instructions[0..self.actual_len].*;
-                }
-            }
-        };
-    }
-
-    fn compile(comptime regex_string: []const u8) CompileResult(regex_string.len) {
+    fn compile(comptime regex_string: []const u8) []const RegexInst {
         comptime {
-            // final instruction list will never be longer than the string length
-            var list: [regex_string.len]RegexInst = undefined;
+            var list: []const RegexInst = &.{};
+
             var i = 0;
 
-            var consumed = 0;
+            while (i < regex_string.len) {
+                const c = regex_string[i];
 
-            while (consumed < regex_string.len) {
-                const c = regex_string[consumed];
-
-                switch (c) {
-                    '*' => {
-                        if (i == 0) {
-                            @compileError("Error parsing regex: InvalidStarLoc");
-                        } else {
-                            list[i - 1].modifier = .star;
-                        }
-                        consumed += 1;
+                const regex_type: RegexType = switch (c) {
+                    '+', '*', '?' => {
+                        @compileError("Error parsing regex, cannot start with modifier: " ++ .{c});
                     },
-                    '+' => {
-                        if (i == 0) {
-                            @compileError("Error parsing regex: InvalidPlusLoc");
-                        } else {
-                            list[i - 1].modifier = .plus;
-                        }
-                        consumed += 1;
-                    },
-                    '?' => {
-                        if (i == 0) {
-                            @compileError("Error parsing regex: InvalidQuestionMarkLoc");
-                        } else {
-                            list[i - 1].modifier = .optional;
-                        }
-                        consumed += 1;
-                    },
-                    '(' => {
+                    '(' => blk: {
                         // find matching closing bracket and recurse
-                        const start = consumed;
-                        var extras: usize = 0;
+                        const start = i;
+                        var extras = 0;
 
                         // consume the (
-                        consumed += 1;
+                        i += 1;
 
-                        while (consumed < regex_string.len) : (consumed += 1) {
-                            const nc = regex_string[consumed];
+                        while (i < regex_string.len) : (i += 1) {
+                            const nc = regex_string[i];
                             if (nc == '(') {
                                 extras += 1;
                             }
@@ -96,65 +61,68 @@ const Regex = struct {
                                 }
                             }
                         }
-                        if (consumed >= regex_string.len) {
+                        if (i >= regex_string.len) {
                             @compileError("Error parsing regex: NoClosingBracketFound");
                         }
 
-                        const group = regex_string[start + 1 .. consumed]; // +1 because we do not want to include the brackets
-                        const comp_group = compile(group).resize();
+                        const group = regex_string[start + 1 .. i]; // +1 because we do not want to include the brackets
+                        const comp_group = compile(group);
 
-                        list[i] = .{
-                            .regex_type = .{ .group = &comp_group },
-                            .modifier = .none,
-                        };
-                        i += 1;
                         // finally consume the )
-                        consumed += 1;
-                    },
-                    '.' => {
-                        list[i] = .{
-                            .regex_type = .dot,
-                            .modifier = .none,
-                        };
                         i += 1;
-                        consumed += 1;
+
+                        break :blk .{ .group = comp_group };
                     },
-                    '\\' => {
+                    '.' => blk: {
+                        i += 1;
+                        break :blk .dot;
+                    },
+                    '\\' => blk: {
                         // consume the \
-                        consumed += 1;
-                        if (consumed >= regex_string.len) {
+                        i += 1;
+                        if (i >= regex_string.len) {
                             @compileError("Error parsing regex: InvalidEscapeSeqAtEOF");
                         }
 
-                        const next_char = regex_string[consumed];
+                        const next_char = regex_string[i];
                         // consume the next char
-                        consumed += 1;
+                        i += 1;
 
-                        list[i] = .{
-                            .regex_type = .{
-                                .literal = next_char,
-                            },
-                            .modifier = .none,
-                        };
-                        i += 1;
+                        break :blk .{ .literal = next_char };
                     },
-                    else => {
-                        list[i] = .{
-                            .regex_type = .{
-                                .literal = c,
-                            },
-                            .modifier = .none,
-                        };
+                    else => blk: {
                         i += 1;
-                        consumed += 1;
+                        break :blk .{ .literal = c };
                     }
-                }
+                };
+
+                const modifier: Modifier =
+                    if (i < regex_string.len)
+                        switch (regex_string[i]) {
+                            '*' => blk: {
+                                i += 1;
+                                break :blk .star;
+                            },
+                            '+' => blk: {
+                                i += 1;
+                                break :blk .plus;
+                            },
+                            '?' => blk: {
+                                i += 1;
+                                break :blk .optional;
+                            },
+                            else => .none,
+                        }
+                    else
+                        .none;
+
+                list = list ++ &[_]RegexInst{.{
+                    .regex_type = regex_type,
+                    .modifier = modifier,
+                }};
             }
 
-            return .{
-                .instructions = list,
-                .actual_len = i,
-            };
+            return list;
         }
     }
 
@@ -307,14 +275,14 @@ pub fn main() !void {
 
     // const string = "a+(b|c)?";
     // const regex_string = "a?b";
-    const regex_string = "a*ab?b";
+    const regex_string = "\\*a*ab?b";
     // const regex_string = "a?(bc?)+";
     // const regex_string = "ab?";
     const regex = Regex.init(regex_string);
 
     // std.debug.print("{any}\n", .{regex.instructions});
 
-    const string = "aabb";
+    const string = "*aabb";
 
     const b = regex.isMatch(allocator, string);
 
