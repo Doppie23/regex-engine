@@ -20,6 +20,20 @@ const Regex = struct {
         literal: u8,
         group: *const RegexAst,
         dot,
+        set: Set,
+    };
+
+    const Set = struct {
+        not: bool,
+        items: []const Item,
+
+        const Item = union(enum) {
+            literal: u8,
+            range: struct {
+                from: u8,
+                to: u8,
+            },
+        };
     };
 
     const Modifier = enum {
@@ -56,6 +70,43 @@ const Regex = struct {
                             .boolean = .{
                                 .left = &left,
                                 .right = &right,
+                            },
+                        };
+                    },
+                    '[' => blk: {
+                        const start = i;
+                        while (regex_string[i] != ']') : (i += 1) {}
+                        const set_string = regex_string[start + 1 .. i];
+                        i += 1;
+
+                        if (set_string.len == 0) {
+                            @compileError("Error parsing regex, cannot have an empty set []");
+                        }
+
+                        var set_items: []const Set.Item = &.{};
+                        var j = 0;
+
+                        const not = set_string[j] == '^';
+                        if (not) j += 1;
+
+                        while (j < set_string.len) {
+                            const char = set_string[j];
+                            if (j + 1 < set_string.len and set_string[j + 1] == '-' and
+                                j + 2 < set_string.len)
+                            {
+                                const range_to = set_string[j + 2];
+                                set_items = set_items ++ &[_]Set.Item{.{ .range = .{ .from = char, .to = range_to } }};
+                                j += 3;
+                            } else {
+                                set_items = set_items ++ &[_]Set.Item{.{ .literal = char }};
+                                j += 1;
+                            }
+                        }
+
+                        break :blk .{
+                            .set = .{
+                                .not = not,
+                                .items = set_items,
                             },
                         };
                     },
@@ -216,6 +267,33 @@ const Regex = struct {
                         .dot => {
                             if (maybe_char) |_| {
                                 break :blk &.{1};
+                            } else {
+                                break :blk &.{0};
+                            }
+                        },
+                        .set => |set| {
+                            if (maybe_char) |char| {
+                                var any_matches = false;
+                                outer: for (set.items) |item| {
+                                    switch (item) {
+                                        .literal => |expected| {
+                                            if (char == expected) {
+                                                any_matches = true;
+                                                break :outer;
+                                            }
+                                        },
+                                        .range => |range| {
+                                            if (range.from <= char and char <= range.to) {
+                                                any_matches = true;
+                                                break :outer;
+                                            }
+                                        }
+                                    }
+                                }
+                                if (set.not) {
+                                    any_matches = !any_matches;
+                                }
+                                break :blk &.{if (any_matches) 1 else 0};
                             } else {
                                 break :blk &.{0};
                             }
@@ -492,6 +570,37 @@ test "regex compilation boolean or" {
     try std.testing.expectEqualSlices(Regex.RegexInst, expected.boolean.right.list, actual.boolean.right.list);
 }
 
+test "regex compilation set" {
+    const string = "[^abc-d]?c";
+    const expected = &[_]Regex.RegexInst{
+        .{
+            .regex_type = .{ .set = .{
+                .not = true,
+                .items = &.{
+                    .{ .literal = 'a' },
+                    .{ .literal = 'b' },
+                    .{ .range = .{ .from = 'c', .to = 'd' } },
+                },
+            } },
+            .modifier = .optional,
+        },
+        .{
+            .regex_type = .{ .literal = 'c' },
+            .modifier = .none,
+        },
+    };
+
+    const regex = Regex.init(string);
+    const actual = regex.ast.list;
+
+    try std.testing.expectEqual(expected.len, actual.len);
+    try std.testing.expectEqual(expected[0].modifier, actual[0].modifier);
+    try std.testing.expectEqual(expected[0].regex_type.set.not, actual[0].regex_type.set.not);
+    try std.testing.expectEqualSlices(Regex.Set.Item, expected[0].regex_type.set.items, actual[0].regex_type.set.items);
+
+    try std.testing.expectEqual(expected[1], actual[1]);
+}
+
 test "matches" {
     const allocator = std.testing.allocator;
 
@@ -656,10 +765,52 @@ test "matches" {
             },
         },
         .{
-            .regex_string = ".+@.+\\.com",
+            .regex_string = "[abc]d",
             .test_strings = &[_]TestString{
-                .{ .string = "a@a.com", .is_match = true },
-                .{ .string = "a.com", .is_match = false },
+                .{ .string = "ad", .is_match = true },
+                .{ .string = "bd", .is_match = true },
+                .{ .string = "cd", .is_match = true },
+                .{ .string = "dd", .is_match = false },
+            },
+        },
+        .{
+            .regex_string = "[^abc]d",
+            .test_strings = &[_]TestString{
+                .{ .string = "dd", .is_match = true },
+                .{ .string = "ad", .is_match = false },
+                .{ .string = "bd", .is_match = false },
+                .{ .string = "cd", .is_match = false },
+            },
+        },
+        .{
+            .regex_string = "[a-e]+",
+            .test_strings = &[_]TestString{
+                .{ .string = "abcde", .is_match = true },
+                .{ .string = "abcdef", .is_match = false },
+            },
+        },
+        .{
+            .regex_string = "[^a-ei-z]+",
+            .test_strings = &[_]TestString{
+                .{ .string = "fgh", .is_match = true },
+                .{ .string = "fghijk", .is_match = false },
+                .{ .string = "abcde", .is_match = false },
+            },
+        },
+        .{
+            .regex_string = "[a-egh]+",
+            .test_strings = &[_]TestString{
+                .{ .string = "abcdegh", .is_match = true },
+                .{ .string = "abcdef", .is_match = false },
+            },
+        },
+        .{
+            .regex_string = "[a-zA-Z0-9]+@[a-zA-Z]+\\.com",
+            .test_strings = &[_]TestString{
+                .{ .string = "a10@a.com", .is_match = true },
+                .{ .string = "a+@a.com", .is_match = false },
+                .{ .string = "a10@10.com", .is_match = false },
+                .{ .string = "a10@10.com", .is_match = false },
             },
         },
     };
