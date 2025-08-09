@@ -1,7 +1,15 @@
 const std = @import("std");
 
 const Regex = struct {
-    instructions: []const RegexInst,
+    ast: RegexAst,
+
+    const RegexAst = union(enum) {
+        boolean: struct {
+            left: *const RegexAst,
+            right: *const RegexAst,
+        },
+        list: []const RegexInst,
+    };
 
     const RegexInst = struct {
         regex_type: RegexType,
@@ -10,7 +18,7 @@ const Regex = struct {
 
     const RegexType = union(enum) {
         literal: u8,
-        group: []const RegexInst,
+        group: *const RegexAst,
         dot,
     };
 
@@ -23,11 +31,11 @@ const Regex = struct {
 
     fn init(comptime regex_string: []const u8) Regex {
         return .{
-            .instructions = comptime compile(regex_string),
+            .ast = comptime compile(regex_string),
         };
     }
 
-    fn compile(comptime regex_string: []const u8) []const RegexInst {
+    fn compile(comptime regex_string: []const u8) RegexAst {
         comptime {
             var list: []const RegexInst = &.{};
 
@@ -39,6 +47,17 @@ const Regex = struct {
                 const regex_type: RegexType = switch (c) {
                     '+', '*', '?' => {
                         @compileError("Error parsing regex, cannot start with modifier: " ++ .{c});
+                    },
+                    '|' => {
+                        const rest = regex_string[i + 1 ..];
+                        const left: RegexAst = .{ .list = list };
+                        const right = compile(rest);
+                        return .{
+                            .boolean = .{
+                                .left = &left,
+                                .right = &right,
+                            },
+                        };
                     },
                     '(' => blk: {
                         // find matching closing bracket and recurse
@@ -71,7 +90,7 @@ const Regex = struct {
                         // finally consume the )
                         i += 1;
 
-                        break :blk .{ .group = comp_group };
+                        break :blk .{ .group = &comp_group };
                     },
                     '.' => blk: {
                         i += 1;
@@ -122,7 +141,7 @@ const Regex = struct {
                 }};
             }
 
-            return list;
+            return .{ .list = list };
         }
     }
 
@@ -130,7 +149,7 @@ const Regex = struct {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
 
-        const res = try consumeMatch(arena.allocator(), self.instructions, string, .only_full);
+        const res = try consumeMatch(arena.allocator(), self.ast, string, .only_full);
         return res.len > 0;
     }
 
@@ -140,133 +159,156 @@ const Regex = struct {
     };
 
     /// returns for all possible valid paths (paths where we can exhaust all instructions) the amount of consumed characters
-    fn consumeMatch(arena: std.mem.Allocator, instructions: []const RegexInst, string: []const u8, match_type: MatchType) ![]usize {
-        const State = struct {
-            instruction_idx: usize,
-            string_idx: usize,
-        };
+    fn consumeMatch(arena: std.mem.Allocator, ast: RegexAst, string: []const u8, match_type: MatchType) ![]usize {
+        switch (ast) {
+            .list => |instructions| {
+                const State = struct {
+                    instruction_idx: usize,
+                    string_idx: usize,
+                };
 
-        var possible_matches = std.ArrayList(usize).init(arena);
-        defer possible_matches.deinit();
+                var possible_matches = std.ArrayList(usize).init(arena);
+                defer possible_matches.deinit();
 
-        var queue = std.ArrayList(State).init(arena);
-        defer queue.deinit();
+                var queue = std.ArrayList(State).init(arena);
+                defer queue.deinit();
 
-        try queue.append(.{
-            .instruction_idx = 0,
-            .string_idx = 0,
-        });
+                try queue.append(.{
+                    .instruction_idx = 0,
+                    .string_idx = 0,
+                });
 
-        while (queue.items.len > 0) {
-            const state = queue.pop().?;
+                while (queue.items.len > 0) {
+                    const state = queue.pop().?;
 
-            if (state.instruction_idx >= instructions.len and state.string_idx >= string.len) {
-                // done with string and instructions, means a full match
-                try possible_matches.append(state.string_idx);
-                if (match_type == .only_full) {
-                    break;
-                } else {
-                    continue;
+                    if (state.instruction_idx >= instructions.len and state.string_idx >= string.len) {
+                        // done with string and instructions, means a full match
+                        try possible_matches.append(state.string_idx);
+                        if (match_type == .only_full) {
+                            break;
+                        } else {
+                            continue;
+                        }
+                    }
+
+                    if (state.instruction_idx >= instructions.len) {
+                        // went through all instructions, yet still part of string left
+                        // so a partial match
+
+                        if (match_type == .partial) {
+                            try possible_matches.append(state.string_idx);
+                        }
+                        continue;
+                    }
+                    const inst = instructions[state.instruction_idx];
+
+                    const maybe_char = if (state.string_idx < string.len) string[state.string_idx] else null;
+
+                    // get all the possible valid paths based on the regex instruction
+                    const amounts_consumed: []const usize = blk: switch (inst.regex_type) {
+                        .literal => |expected| {
+                            if (maybe_char) |char| {
+                                break :blk &.{(if (char == expected) 1 else 0)};
+                            } else {
+                                break :blk &.{0};
+                            }
+                        },
+                        .dot => {
+                            if (maybe_char) |_| {
+                                break :blk &.{1};
+                            } else {
+                                break :blk &.{0};
+                            }
+                        },
+                        .group => |group_instructions| {
+                            // NOTE: we dont free the returned value here, we just assume it gets cleaned up when the arena is freed.
+                            break :blk try consumeMatch(arena, group_instructions.*, string[state.string_idx..], .partial);
+                        },
+                    };
+
+                    // determine based on the modifier all the extra paths we can follow
+                    switch (inst.modifier) {
+                        .none => {
+                            for (amounts_consumed) |consumed| {
+                                if (consumed > 0) {
+                                    try queue.append(.{
+                                        .instruction_idx = state.instruction_idx + 1,
+                                        .string_idx = state.string_idx + consumed,
+                                    });
+                                }
+                            }
+                        },
+                        .plus => {
+                            for (amounts_consumed) |consumed| {
+                                if (consumed > 0) {
+                                    try queue.append(.{
+                                        .instruction_idx = state.instruction_idx + 1,
+                                        .string_idx = state.string_idx + consumed,
+                                    });
+                                    try queue.append(.{
+                                        .instruction_idx = state.instruction_idx,
+                                        .string_idx = state.string_idx + consumed,
+                                    });
+                                }
+                            }
+                        },
+                        .star => {
+                            for (amounts_consumed) |consumed| {
+                                if (consumed > 0) {
+                                    try queue.append(.{
+                                        .instruction_idx = state.instruction_idx + 1,
+                                        .string_idx = state.string_idx + consumed,
+                                    });
+                                    try queue.append(.{
+                                        .instruction_idx = state.instruction_idx,
+                                        .string_idx = state.string_idx + consumed,
+                                    });
+                                }
+                            }
+                            try queue.append(.{
+                                .instruction_idx = state.instruction_idx + 1,
+                                .string_idx = state.string_idx,
+                            });
+                        },
+                        .optional => {
+                            for (amounts_consumed) |consumed| {
+                                if (consumed > 0) {
+                                    try queue.append(.{
+                                        .instruction_idx = state.instruction_idx + 1,
+                                        .string_idx = state.string_idx + consumed,
+                                    });
+                                }
+                            }
+                            try queue.append(.{
+                                .instruction_idx = state.instruction_idx + 1,
+                                .string_idx = state.string_idx,
+                            });
+                        },
+                    }
                 }
-            }
 
-            if (state.instruction_idx >= instructions.len) {
-                // went through all instructions, yet still part of string left
-                // so a partial match
+                return possible_matches.toOwnedSlice();
+            },
+            .boolean => |b| {
+                const res_left = try consumeMatch(arena, b.left.*, string, match_type);
+                const res_right = try consumeMatch(arena, b.right.*, string, match_type);
 
-                if (match_type == .partial) {
-                    try possible_matches.append(state.string_idx);
+                var buffer = try arena.alloc(usize, res_left.len + res_right.len);
+                var i: usize = 0;
+
+                for (res_left) |e| {
+                    buffer[i] = e;
+                    i += 1;
                 }
-                continue;
-            }
-            const inst = instructions[state.instruction_idx];
 
-            const maybe_char = if (state.string_idx < string.len) string[state.string_idx] else null;
+                for (res_right) |e| {
+                    buffer[i] = e;
+                    i += 1;
+                }
 
-            // get all the possible valid paths based on the regex instruction
-            const amounts_consumed: []const usize = blk: switch (inst.regex_type) {
-                .literal => |expected| {
-                    if (maybe_char) |char| {
-                        break :blk &.{(if (char == expected) 1 else 0)};
-                    } else {
-                        break :blk &.{0};
-                    }
-                },
-                .dot => {
-                    if (maybe_char) |_| {
-                        break :blk &.{1};
-                    } else {
-                        break :blk &.{0};
-                    }
-                },
-                .group => |group_instructions| {
-                    // NOTE: we dont free the returned value here, we just assume it gets cleaned up when the arena is freed.
-                    break :blk try consumeMatch(arena, group_instructions, string[state.string_idx..], .partial);
-                },
-            };
-
-            // determine based on the modifier all the extra paths we can follow
-            switch (inst.modifier) {
-                .none => {
-                    for (amounts_consumed) |consumed| {
-                        if (consumed > 0) {
-                            try queue.append(.{
-                                .instruction_idx = state.instruction_idx + 1,
-                                .string_idx = state.string_idx + consumed,
-                            });
-                        }
-                    }
-                },
-                .plus => {
-                    for (amounts_consumed) |consumed| {
-                        if (consumed > 0) {
-                            try queue.append(.{
-                                .instruction_idx = state.instruction_idx + 1,
-                                .string_idx = state.string_idx + consumed,
-                            });
-                            try queue.append(.{
-                                .instruction_idx = state.instruction_idx,
-                                .string_idx = state.string_idx + consumed,
-                            });
-                        }
-                    }
-                },
-                .star => {
-                    for (amounts_consumed) |consumed| {
-                        if (consumed > 0) {
-                            try queue.append(.{
-                                .instruction_idx = state.instruction_idx + 1,
-                                .string_idx = state.string_idx + consumed,
-                            });
-                            try queue.append(.{
-                                .instruction_idx = state.instruction_idx,
-                                .string_idx = state.string_idx + consumed,
-                            });
-                        }
-                    }
-                    try queue.append(.{
-                        .instruction_idx = state.instruction_idx + 1,
-                        .string_idx = state.string_idx,
-                    });
-                },
-                .optional => {
-                    for (amounts_consumed) |consumed| {
-                        if (consumed > 0) {
-                            try queue.append(.{
-                                .instruction_idx = state.instruction_idx + 1,
-                                .string_idx = state.string_idx + consumed,
-                            });
-                        }
-                    }
-                    try queue.append(.{
-                        .instruction_idx = state.instruction_idx + 1,
-                        .string_idx = state.string_idx,
-                    });
-                },
-            }
+                return buffer;
+            },
         }
-
-        return possible_matches.toOwnedSlice();
     }
 };
 
@@ -275,14 +317,17 @@ pub fn main() !void {
 
     // const string = "a+(b|c)?";
     // const regex_string = "a?b";
-    const regex_string = "\\*a*ab?b";
+    // const regex_string = "\\*a*ab?b";
     // const regex_string = "a?(bc?)+";
-    // const regex_string = "ab?";
+    // const regex_string = "gr(a|e)y";
+    const regex_string = "gr(a|e)y";
     const regex = Regex.init(regex_string);
 
-    // std.debug.print("{any}\n", .{regex.instructions});
+    // std.debug.print("{any}\n", .{regex.ast.list[2]});
+    // std.debug.print("{any}\n", .{regex.ast.list[2].regex_type.group.boolean.left.list[0]});
+    // std.debug.print("{any}\n", .{regex.ast.list[2].regex_type.group.boolean.right.list[0]});
 
-    const string = "*aabb";
+    const string = "gryy";
 
     const b = regex.isMatch(allocator, string);
 
@@ -393,7 +438,7 @@ test "regex compilation modifiers" {
 
     inline for (tests) |t| {
         const regex = Regex.init(t.regex_string);
-        const actual = regex.instructions;
+        const actual = regex.ast.list;
         try std.testing.expectEqualSlices(Regex.RegexInst, t.expected, actual);
     }
 }
@@ -406,21 +451,45 @@ test "regex compilation groups" {
             .modifier = .optional,
         },
         .{
-            .regex_type = .{ .group = &[_]Regex.RegexInst{
+            .regex_type = .{ .group = &.{ .list = &[_]Regex.RegexInst{
                 .{ .modifier = .none, .regex_type = .{ .literal = 'b' } },
                 .{ .modifier = .optional, .regex_type = .{ .literal = 'c' } },
-            } },
+            } } },
             .modifier = .plus,
         },
     };
 
     const regex = Regex.init(string);
-    const actual = regex.instructions;
+    const actual = regex.ast.list;
 
     try std.testing.expectEqual(expected.len, actual.len);
     try std.testing.expectEqual(expected[0], actual[0]);
     try std.testing.expectEqual(expected[1].modifier, actual[1].modifier);
-    try std.testing.expectEqualSlices(Regex.RegexInst, expected[1].regex_type.group, actual[1].regex_type.group);
+    try std.testing.expectEqualSlices(Regex.RegexInst, expected[1].regex_type.group.list, actual[1].regex_type.group.list);
+}
+
+test "regex compilation boolean or" {
+    const string = "a?|b+";
+    const expected = Regex.RegexAst{
+        .boolean = .{
+            .left = &.{
+                .list = &.{
+                    .{ .regex_type = .{ .literal = 'a' }, .modifier = .optional },
+                },
+            },
+            .right = &.{
+                .list = &.{
+                    .{ .regex_type = .{ .literal = 'b' }, .modifier = .plus },
+                },
+            },
+        },
+    };
+
+    const regex = Regex.init(string);
+    const actual = regex.ast;
+
+    try std.testing.expectEqualSlices(Regex.RegexInst, expected.boolean.left.list, actual.boolean.left.list);
+    try std.testing.expectEqualSlices(Regex.RegexInst, expected.boolean.right.list, actual.boolean.right.list);
 }
 
 test "matches" {
@@ -513,6 +582,77 @@ test "matches" {
                 .{ .string = "a", .is_match = true },
                 .{ .string = "ababa", .is_match = true },
                 .{ .string = "ba", .is_match = false },
+            },
+        },
+        .{
+            .regex_string = "a|b",
+            .test_strings = &[_]TestString{
+                .{ .string = "a", .is_match = true },
+                .{ .string = "b", .is_match = true },
+                .{ .string = "c", .is_match = false },
+            },
+        },
+        .{
+            .regex_string = "a|b|c",
+            .test_strings = &[_]TestString{
+                .{ .string = "a", .is_match = true },
+                .{ .string = "b", .is_match = true },
+                .{ .string = "c", .is_match = true },
+                .{ .string = "d", .is_match = false },
+            },
+        },
+        .{
+            .regex_string = "gray|grey",
+            .test_strings = &[_]TestString{
+                .{ .string = "gray", .is_match = true },
+                .{ .string = "grey", .is_match = true },
+                .{ .string = "gruy", .is_match = false },
+            },
+        },
+        .{
+            .regex_string = "gr(e|a)y",
+            .test_strings = &[_]TestString{
+                .{ .string = "gray", .is_match = true },
+                .{ .string = "grey", .is_match = true },
+                .{ .string = "gruy", .is_match = false },
+            },
+        },
+        .{
+            .regex_string = "ab(ab|cd)+e",
+            .test_strings = &[_]TestString{
+                .{ .string = "abcdabe", .is_match = true },
+                .{ .string = "ababcde", .is_match = true },
+                .{ .string = "abcde", .is_match = true },
+                .{ .string = "abade", .is_match = false },
+            },
+        },
+        .{
+            .regex_string = "ab(ab|cd)*e?",
+            .test_strings = &[_]TestString{
+                .{ .string = "abcdabe", .is_match = true },
+                .{ .string = "abcdab", .is_match = true },
+                .{ .string = "ababcde", .is_match = true },
+                .{ .string = "ababcd", .is_match = true },
+                .{ .string = "abcde", .is_match = true },
+                .{ .string = "abe", .is_match = true },
+                .{ .string = "ab", .is_match = true },
+                .{ .string = "abade", .is_match = false },
+            },
+        },
+        .{
+            .regex_string = "a(b+|c+)*d",
+            .test_strings = &[_]TestString{
+                .{ .string = "ad", .is_match = true },
+                .{ .string = "acccccd", .is_match = true },
+                .{ .string = "abbbbbd", .is_match = true },
+                .{ .string = "accbbbcccd", .is_match = true },
+                .{ .string = "add", .is_match = false },
+            },
+        },
+        .{
+            .regex_string = "a(bc?d|efg)+",
+            .test_strings = &[_]TestString{
+                .{ .string = "abcdbdefgbd", .is_match = true },
             },
         },
         .{
