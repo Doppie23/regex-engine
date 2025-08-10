@@ -23,3 +23,28 @@ of understanding regex internals and exploring Zig's features.
 ## Limitations
 
 - Only supports full-string match checks.
+
+## Getting Started
+
+- Zig `0.14.1`
+
+Run all the tests, located in [`src/Regex.zig`](./src/Regex.zig):
+
+```console
+$ zig build test
+```
+
+Run a simple example, located in [`src/main.zig`](./src/main.zig):
+
+```console
+$ zig build run
+```
+
+## Usage
+
+```
+const regex = Regex.init("gr(a|e)y");
+const is_match = regex.isMatch("gray");
+std.debug.print("{any}\n", .{is_match});
+// true
+```
